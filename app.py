@@ -715,103 +715,164 @@ if 'df' in st.session_state:
             mime="text/csv",
         )
 
-    # TAB 5: Análisis de Patrones
+    # TAB 5: Análisis de Patrones del período actual
     with tab5:
         st.markdown("#### 🔍 Análisis de Patrones")
-        st.markdown("*Detecta productos y sucursales con problemas recurrentes a lo largo del tiempo.*")
+        st.markdown(f"*Análisis de incongruencias del período {fi} a {ff}*")
 
-        df_hist = cargar_historial()
+        df_incong_pat = df[df['Estado'].isin(['FALTANTE', 'SOBRANTE'])].copy()
 
-        if df_hist.empty or len(set(df_hist['fecha_inicio'] + '_' + df_hist['fecha_fin'])) < 2:
-            st.warning("Se necesitan al menos **2 cruces de diferentes períodos** para detectar patrones. Ejecuta más cruces con diferentes rangos de fechas para acumular historial.")
-            cruces_realizados = 0 if df_hist.empty else len(set(df_hist['fecha_inicio'] + '_' + df_hist['fecha_fin']))
-            st.metric("Cruces en historial", cruces_realizados)
+        if df_incong_pat.empty:
+            st.success("🎉 No hay incongruencias en este período. ¡Todo cuadra!")
         else:
-            patrones = analizar_patrones(df_hist)
+            # Métricas del análisis
+            total_falt = len(df_incong_pat[df_incong_pat['Estado'] == 'FALTANTE'])
+            total_sobr = len(df_incong_pat[df_incong_pat['Estado'] == 'SOBRANTE'])
+            piezas_falt = df_incong_pat[df_incong_pat['Estado'] == 'FALTANTE']['Diferencia'].sum()
+            piezas_sobr = df_incong_pat[df_incong_pat['Estado'] == 'SOBRANTE']['Diferencia'].sum()
 
-            if 'sin_datos' in patrones:
-                st.success("No se encontraron incongruencias en el historial.")
+            pm1, pm2, pm3, pm4 = st.columns(4)
+            pm1.metric("Productos Faltantes", f"{total_falt}")
+            pm2.metric("Piezas Faltantes", f"{piezas_falt:,.0f}")
+            pm3.metric("Productos Sobrantes", f"{total_sobr}")
+            pm4.metric("Piezas Sobrantes", f"{piezas_sobr:,.0f}")
+
+            st.markdown("---")
+
+            # === 1. RANKING DE SUCURSALES CON MÁS PROBLEMAS ===
+            st.markdown("##### 🏪 Sucursales con Más Problemas")
+            st.markdown("*¿Qué sucursales concentran las incongruencias?*")
+
+            suc_analisis = df_incong_pat.groupby('Sucursal').agg(
+                Total_Incidentes=('Estado', 'count'),
+                Faltantes=('Estado', lambda x: (x == 'FALTANTE').sum()),
+                Sobrantes=('Estado', lambda x: (x == 'SOBRANTE').sum()),
+                Piezas_Faltantes=('Diferencia', lambda x: x[df_incong_pat.loc[x.index, 'Estado'] == 'FALTANTE'].sum()),
+                Piezas_Sobrantes=('Diferencia', lambda x: x[df_incong_pat.loc[x.index, 'Estado'] == 'SOBRANTE'].sum()),
+                Productos_Afectados=('Producto', 'nunique'),
+                Folios_Afectados=('Folio Venta', 'nunique'),
+            ).sort_values('Total_Incidentes', ascending=False)
+
+            # Calcular % de error por sucursal
+            total_por_suc = df.groupby('Sucursal').size()
+            suc_analisis['Total_Productos'] = suc_analisis.index.map(lambda x: total_por_suc.get(x, 0))
+            suc_analisis['Porcentaje_Error'] = (suc_analisis['Total_Incidentes'] / suc_analisis['Total_Productos'] * 100).round(1)
+
+            suc_display = suc_analisis.reset_index()
+            suc_display.columns = ['Sucursal', 'Incidentes', 'Faltantes', 'Sobrantes', 'Pzas Faltantes',
+                                   'Pzas Sobrantes', 'Productos', 'Folios', 'Total Cruzados', '% Error']
+
+            st.dataframe(suc_display, use_container_width=True, height=350)
+
+            # Gráfica de sucursales
+            st.bar_chart(suc_analisis['Total_Incidentes'].sort_values(ascending=True))
+
+            st.markdown("---")
+
+            # === 2. PRODUCTOS CON MÁS FALTANTES ===
+            st.markdown("##### 🚨 Productos con Más Faltantes")
+            st.markdown("*¿Qué productos faltan más? Si un producto falta en varias sucursales, puede ser un problema de surtido. Si falta solo en una, puede ser un problema local.*")
+
+            faltantes_df = df_incong_pat[df_incong_pat['Estado'] == 'FALTANTE']
+            if not faltantes_df.empty:
+                prod_falt = faltantes_df.groupby('Producto').agg(
+                    Veces_Faltante=('Estado', 'count'),
+                    Total_Piezas=('Diferencia', 'sum'),
+                    Sucursales=('Sucursal', lambda x: ', '.join(sorted(set(x)))),
+                    Num_Sucursales=('Sucursal', 'nunique'),
+                    Folios=('Folio Venta', lambda x: ', '.join(sorted(set(x)))),
+                ).sort_values('Total_Piezas', ascending=False)
+
+                prod_falt_display = prod_falt.reset_index()
+                prod_falt_display.columns = ['Producto', 'Veces Faltante', 'Total Piezas', 'Sucursales', 'Num Sucursales', 'Folios']
+
+                # Clasificar
+                prod_falt_display['Alerta'] = prod_falt_display.apply(lambda r:
+                    '🔴 Falta en múltiples sucursales' if r['Num Sucursales'] >= 3
+                    else ('🟡 Falta en ' + str(r['Num Sucursales']) + ' sucursal(es)' if r['Veces Faltante'] >= 2
+                    else '🟢 Incidente aislado'), axis=1)
+
+                st.dataframe(prod_falt_display, use_container_width=True, height=400)
+
+                # Top 10 gráfica
+                top_falt = prod_falt['Total_Piezas'].head(10).sort_values(ascending=True)
+                if len(top_falt) > 0:
+                    st.markdown("**Top 10 productos por piezas faltantes:**")
+                    st.bar_chart(top_falt)
             else:
-                resumen = patrones['resumen']
-                rc1, rc2, rc3, rc4 = st.columns(4)
-                rc1.metric("Cruces Realizados", resumen['total_cruces'])
-                rc2.metric("Total Incongruencias", resumen['total_incongruencias'])
-                rc3.metric("Productos con Problemas", resumen['productos_unicos_con_problemas'])
-                rc4.metric("Sucursales con Problemas", resumen['sucursales_con_problemas'])
+                st.success("No hay faltantes en este período.")
 
-                st.markdown("---")
+            st.markdown("---")
 
-                # Alerta de productos faltantes recurrentes
-                st.markdown("##### 🚨 Productos con Faltantes Recurrentes")
-                st.markdown("*Productos que faltan repetidamente — posible robo hormiga o error sistemático.*")
-                if 'productos_faltantes_recurrentes' in patrones and not patrones['productos_faltantes_recurrentes'].empty:
-                    df_pf = patrones['productos_faltantes_recurrentes'].reset_index()
-                    df_pf.columns = ['Producto', 'Veces Faltante', 'Total Piezas Faltantes', 'Sucursales Afectadas', 'Períodos Distintos']
+            # === 3. PRODUCTOS CON MÁS SOBRANTES ===
+            st.markdown("##### 📦 Productos con Más Sobrantes")
+            st.markdown("*Sobrantes pueden indicar errores de escaneo, confusión de productos, o duplicación de recepciones.*")
 
-                    # Clasificar nivel de riesgo
-                    df_pf['Riesgo'] = df_pf.apply(lambda r:
-                        '🔴 ALTO' if r['Veces Faltante'] >= 5 or r['Total Piezas Faltantes'] >= 20
-                        else ('🟡 MEDIO' if r['Veces Faltante'] >= 3 else '🟢 BAJO'), axis=1)
+            sobrantes_df = df_incong_pat[df_incong_pat['Estado'] == 'SOBRANTE']
+            if not sobrantes_df.empty:
+                prod_sobr = sobrantes_df.groupby('Producto').agg(
+                    Veces_Sobrante=('Estado', 'count'),
+                    Total_Piezas=('Diferencia', 'sum'),
+                    Sucursales=('Sucursal', lambda x: ', '.join(sorted(set(x)))),
+                    Num_Sucursales=('Sucursal', 'nunique'),
+                ).sort_values('Total_Piezas', ascending=False)
 
-                    st.dataframe(df_pf, use_container_width=True, height=400)
-                else:
-                    st.success("No se detectaron productos con faltantes recurrentes.")
+                prod_sobr_display = prod_sobr.reset_index()
+                prod_sobr_display.columns = ['Producto', 'Veces Sobrante', 'Total Piezas', 'Sucursales', 'Num Sucursales']
 
-                st.markdown("---")
+                st.dataframe(prod_sobr_display, use_container_width=True, height=400)
+            else:
+                st.success("No hay sobrantes en este período.")
 
-                # Combinación producto + sucursal
-                st.markdown("##### 🎯 Combinaciones Sospechosas (Producto + Sucursal)")
-                st.markdown("*El mismo producto falta repetidamente en la misma sucursal — patrón muy específico.*")
-                if 'combo_sospechoso' in patrones and not patrones['combo_sospechoso'].empty:
-                    df_combo = patrones['combo_sospechoso'].reset_index()
-                    df_combo.columns = ['Sucursal', 'Producto', 'Veces', 'Total Piezas Faltantes', 'Períodos Distintos']
+            st.markdown("---")
 
-                    df_combo['Riesgo'] = df_combo.apply(lambda r:
-                        '🔴 ALTO' if r['Veces'] >= 4 or r['Total Piezas Faltantes'] >= 15
-                        else ('🟡 MEDIO' if r['Veces'] >= 3 else '🟢 BAJO'), axis=1)
+            # === 4. ANÁLISIS POR FOLIO ===
+            st.markdown("##### 📄 Folios con Más Problemas")
+            st.markdown("*¿Hay pedidos específicos que concentran errores? Puede indicar un turno o persona con problemas.*")
 
-                    st.dataframe(df_combo, use_container_width=True, height=400)
-                else:
-                    st.success("No se detectaron combinaciones sospechosas.")
+            folio_analisis = df_incong_pat.groupby(['Folio Venta', 'Sucursal']).agg(
+                Incidentes=('Estado', 'count'),
+                Faltantes=('Estado', lambda x: (x == 'FALTANTE').sum()),
+                Sobrantes=('Estado', lambda x: (x == 'SOBRANTE').sum()),
+                Piezas_Diferencia=('Diferencia', 'sum'),
+                Productos=('Producto', 'nunique'),
+            ).sort_values('Incidentes', ascending=False)
 
-                st.markdown("---")
+            folio_display = folio_analisis.reset_index()
+            folio_display.columns = ['Folio', 'Sucursal', 'Incidentes', 'Faltantes', 'Sobrantes', 'Total Piezas Dif.', 'Productos Afectados']
 
-                # Sucursales problemáticas
-                st.markdown("##### 🏪 Sucursales con Más Incongruencias")
-                if 'sucursales_problematicas' in patrones:
-                    df_suc = patrones['sucursales_problematicas'].reset_index()
-                    df_suc.columns = ['Sucursal', 'Total Incidentes', 'Faltantes', 'Sobrantes', 'Piezas Faltantes', 'Productos Afectados', 'Períodos']
-                    st.dataframe(df_suc, use_container_width=True, height=400)
+            st.dataframe(folio_display.head(20), use_container_width=True, height=350)
 
-                    # Gráfica
-                    st.bar_chart(df_suc.set_index('Sucursal')['Total Incidentes'].sort_values(ascending=True))
+            st.markdown("---")
 
-                st.markdown("---")
+            # === 5. POSIBLES CONFUSIONES DE PRODUCTO ===
+            st.markdown("##### 🔄 Posibles Confusiones de Producto")
+            st.markdown("*Dentro del mismo folio, si un producto falta y otro sobra, puede ser una confusión al surtir o recibir.*")
 
-                # Productos con sobrantes recurrentes
-                st.markdown("##### 📦 Productos con Sobrantes Recurrentes")
-                st.markdown("*Productos que sobran repetidamente — posible error de catálogo o doble escaneo.*")
-                if 'productos_sobrantes_recurrentes' in patrones and not patrones['productos_sobrantes_recurrentes'].empty:
-                    df_ps = patrones['productos_sobrantes_recurrentes'].reset_index()
-                    df_ps.columns = ['Producto', 'Veces Sobrante', 'Total Piezas Sobrantes', 'Sucursales']
-                    st.dataframe(df_ps, use_container_width=True, height=300)
-                else:
-                    st.success("No se detectaron productos con sobrantes recurrentes.")
+            confusiones = []
+            for folio in df_incong_pat['Folio Venta'].unique():
+                folio_data = df_incong_pat[df_incong_pat['Folio Venta'] == folio]
+                falt_folio = folio_data[folio_data['Estado'] == 'FALTANTE']
+                sobr_folio = folio_data[folio_data['Estado'] == 'SOBRANTE']
 
-                st.markdown("---")
+                if not falt_folio.empty and not sobr_folio.empty:
+                    for _, f in falt_folio.iterrows():
+                        for _, s in sobr_folio.iterrows():
+                            confusiones.append({
+                                'Folio': folio,
+                                'Sucursal': f['Sucursal'],
+                                'Producto Faltante': f['Producto'],
+                                'Pzas Faltantes': f['Diferencia'],
+                                'Producto Sobrante': s['Producto'],
+                                'Pzas Sobrantes': s['Diferencia'],
+                            })
 
-                # Botón para limpiar historial
-                st.markdown("##### ⚙️ Administrar Historial")
-                col_admin1, col_admin2 = st.columns(2)
-                with col_admin1:
-                    st.metric("Registros en historial", len(df_hist))
-                with col_admin2:
-                    if st.button("🗑️ Limpiar historial", type="secondary"):
-                        if os.path.exists(DB_PATH):
-                            os.remove(DB_PATH)
-                            init_db()
-                            st.success("Historial limpiado.")
-                            st.rerun()
+            if confusiones:
+                df_conf = pd.DataFrame(confusiones)
+                st.dataframe(df_conf, use_container_width=True, height=350)
+                st.info(f"Se detectaron **{len(confusiones)}** posibles confusiones de producto. Revisa si los productos faltantes y sobrantes son similares (mismo tipo, tamaño parecido, etc.)")
+            else:
+                st.success("No se detectaron posibles confusiones de producto.")
 
 else:
     # Estado inicial
