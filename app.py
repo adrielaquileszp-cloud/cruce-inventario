@@ -10,6 +10,135 @@ from datetime import datetime, date, timedelta
 from collections import defaultdict
 import re
 import io
+import sqlite3
+import os
+
+# ============================================================
+# BASE DE DATOS DE HISTORIAL
+# ============================================================
+DB_PATH = "historial_cruces.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS historial (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha_cruce TEXT,
+            fecha_inicio TEXT,
+            fecha_fin TEXT,
+            folio_venta TEXT,
+            folio_compra TEXT,
+            sucursal TEXT,
+            producto TEXT,
+            udm TEXT,
+            surtido REAL,
+            recibido REAL,
+            diferencia REAL,
+            estado TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def guardar_historial(df, fecha_inicio, fecha_fin):
+    conn = sqlite3.connect(DB_PATH)
+    # Verificar si ya existe este cruce (mismas fechas)
+    existing = pd.read_sql_query(
+        "SELECT COUNT(*) as n FROM historial WHERE fecha_inicio=? AND fecha_fin=?",
+        conn, params=(fecha_inicio, fecha_fin)
+    )
+    if existing['n'].iloc[0] > 0:
+        conn.execute("DELETE FROM historial WHERE fecha_inicio=? AND fecha_fin=?",
+                     (fecha_inicio, fecha_fin))
+
+    fecha_cruce = datetime.now().isoformat()
+    for _, row in df.iterrows():
+        conn.execute("""
+            INSERT INTO historial (fecha_cruce, fecha_inicio, fecha_fin, folio_venta,
+                folio_compra, sucursal, producto, udm, surtido, recibido, diferencia, estado)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (fecha_cruce, fecha_inicio, fecha_fin, row['Folio Venta'],
+              row.get('Folio Compra', '-'), row['Sucursal'], row['Producto'],
+              row['UdM'], row['Surtido'], row['Recibido'], row['Diferencia'], row['Estado']))
+    conn.commit()
+    conn.close()
+
+def cargar_historial():
+    if not os.path.exists(DB_PATH):
+        return pd.DataFrame()
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query("SELECT * FROM historial", conn)
+    conn.close()
+    return df
+
+def analizar_patrones(df_hist):
+    """Analiza el historial para detectar patrones sospechosos."""
+    if df_hist.empty:
+        return {}
+
+    # Solo incongruencias reales
+    incong = df_hist[df_hist['estado'].isin(['FALTANTE', 'SOBRANTE'])].copy()
+    if incong.empty:
+        return {'sin_datos': True}
+
+    resultados = {}
+
+    # 1. PRODUCTOS CON FALTANTES RECURRENTES (posible robo hormiga)
+    faltantes = incong[incong['estado'] == 'FALTANTE']
+    if not faltantes.empty:
+        prod_faltantes = faltantes.groupby('producto').agg(
+            veces=('id', 'count'),
+            total_faltante=('diferencia', 'sum'),
+            sucursales=('sucursal', lambda x: ', '.join(sorted(set(x)))),
+            periodos=('fecha_inicio', lambda x: len(set(x))),
+        ).sort_values('veces', ascending=False)
+        prod_faltantes = prod_faltantes[prod_faltantes['veces'] >= 2]
+        resultados['productos_faltantes_recurrentes'] = prod_faltantes
+
+    # 2. SUCURSALES CON MÁS INCONGRUENCIAS
+    suc_incong = incong.groupby('sucursal').agg(
+        total_incidentes=('id', 'count'),
+        faltantes=('estado', lambda x: (x == 'FALTANTE').sum()),
+        sobrantes=('estado', lambda x: (x == 'SOBRANTE').sum()),
+        total_piezas_faltantes=('diferencia', lambda x: x[incong.loc[x.index, 'estado'] == 'FALTANTE'].sum()),
+        productos_afectados=('producto', lambda x: len(set(x))),
+        periodos=('fecha_inicio', lambda x: len(set(x))),
+    ).sort_values('total_incidentes', ascending=False)
+    resultados['sucursales_problematicas'] = suc_incong
+
+    # 3. COMBINACIÓN PRODUCTO + SUCURSAL (patrón más específico)
+    combo = faltantes.groupby(['sucursal', 'producto']).agg(
+        veces=('id', 'count'),
+        total_faltante=('diferencia', 'sum'),
+        periodos=('fecha_inicio', lambda x: len(set(x))),
+    ).sort_values('veces', ascending=False)
+    combo = combo[combo['veces'] >= 2]
+    resultados['combo_sospechoso'] = combo
+
+    # 4. PRODUCTOS CON SOBRANTES RECURRENTES (error de proceso)
+    sobrantes = incong[incong['estado'] == 'SOBRANTE']
+    if not sobrantes.empty:
+        prod_sobrantes = sobrantes.groupby('producto').agg(
+            veces=('id', 'count'),
+            total_sobrante=('diferencia', 'sum'),
+            sucursales=('sucursal', lambda x: ', '.join(sorted(set(x)))),
+        ).sort_values('veces', ascending=False)
+        prod_sobrantes = prod_sobrantes[prod_sobrantes['veces'] >= 2]
+        resultados['productos_sobrantes_recurrentes'] = prod_sobrantes
+
+    # 5. RESUMEN GENERAL
+    total_cruces = len(set(df_hist['fecha_inicio'] + '_' + df_hist['fecha_fin']))
+    resultados['resumen'] = {
+        'total_cruces': total_cruces,
+        'total_registros': len(df_hist),
+        'total_incongruencias': len(incong),
+        'productos_unicos_con_problemas': len(set(incong['producto'])),
+        'sucursales_con_problemas': len(set(incong['sucursal'])),
+    }
+
+    return resultados
+
+init_db()
 
 # ============================================================
 # CONFIGURACIÓN DE LA PÁGINA
@@ -407,6 +536,10 @@ if ejecutar:
                 st.session_state['fecha_inicio'] = str(fecha_inicio)
                 st.session_state['fecha_fin'] = str(fecha_fin)
 
+                # Guardar en historial
+                guardar_historial(df, str(fecha_inicio), str(fecha_fin))
+                st.success(f"Resultados guardados en historial ({len(df)} registros)")
+
 # Mostrar resultados si existen
 if 'df' in st.session_state:
     df = st.session_state['df']
@@ -432,7 +565,7 @@ if 'df' in st.session_state:
     c6.metric("Precisión", f"{precision:.1f}%")
 
     # Tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Resumen", "❌ Incongruencias", "📄 Detalle Completo", "📥 Descargar"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Resumen", "❌ Incongruencias", "📄 Detalle Completo", "📥 Descargar", "🔍 Patrones"])
 
     # TAB 1: Resumen por sucursal
     with tab1:
@@ -545,8 +678,13 @@ if 'df' in st.session_state:
                 # Detalle
                 df.to_excel(writer, sheet_name='Detalle Completo', index=False)
 
-                # Solo incongruencias
-                df[df['Estado'] != 'OK'].to_excel(writer, sheet_name='Incongruencias', index=False)
+                # Solo incongruencias (sin EN TRÁNSITO)
+                df[df['Estado'].isin(['FALTANTE', 'SOBRANTE'])].to_excel(writer, sheet_name='Incongruencias', index=False)
+
+                # En tránsito
+                df_transito = df[df['Estado'] == 'EN TRÁNSITO']
+                if len(df_transito) > 0:
+                    df_transito.to_excel(writer, sheet_name='En Tránsito', index=False)
 
             st.download_button(
                 label="⬇️ Descargar Excel",
@@ -569,13 +707,111 @@ if 'df' in st.session_state:
 
         st.markdown("---")
         st.markdown("**📄 Solo Incongruencias (CSV)**")
-        csv_incong = df[df['Estado'] != 'OK'].to_csv(index=False).encode('utf-8-sig')
+        csv_incong = df[df['Estado'].isin(['FALTANTE', 'SOBRANTE'])].to_csv(index=False).encode('utf-8-sig')
         st.download_button(
             label="⬇️ Descargar solo incongruencias",
             data=csv_incong,
             file_name=f"incongruencias_{fi}_a_{ff}.csv",
             mime="text/csv",
         )
+
+    # TAB 5: Análisis de Patrones
+    with tab5:
+        st.markdown("#### 🔍 Análisis de Patrones")
+        st.markdown("*Detecta productos y sucursales con problemas recurrentes a lo largo del tiempo.*")
+
+        df_hist = cargar_historial()
+
+        if df_hist.empty or len(set(df_hist['fecha_inicio'] + '_' + df_hist['fecha_fin'])) < 2:
+            st.warning("Se necesitan al menos **2 cruces de diferentes períodos** para detectar patrones. Ejecuta más cruces con diferentes rangos de fechas para acumular historial.")
+            cruces_realizados = 0 if df_hist.empty else len(set(df_hist['fecha_inicio'] + '_' + df_hist['fecha_fin']))
+            st.metric("Cruces en historial", cruces_realizados)
+        else:
+            patrones = analizar_patrones(df_hist)
+
+            if 'sin_datos' in patrones:
+                st.success("No se encontraron incongruencias en el historial.")
+            else:
+                resumen = patrones['resumen']
+                rc1, rc2, rc3, rc4 = st.columns(4)
+                rc1.metric("Cruces Realizados", resumen['total_cruces'])
+                rc2.metric("Total Incongruencias", resumen['total_incongruencias'])
+                rc3.metric("Productos con Problemas", resumen['productos_unicos_con_problemas'])
+                rc4.metric("Sucursales con Problemas", resumen['sucursales_con_problemas'])
+
+                st.markdown("---")
+
+                # Alerta de productos faltantes recurrentes
+                st.markdown("##### 🚨 Productos con Faltantes Recurrentes")
+                st.markdown("*Productos que faltan repetidamente — posible robo hormiga o error sistemático.*")
+                if 'productos_faltantes_recurrentes' in patrones and not patrones['productos_faltantes_recurrentes'].empty:
+                    df_pf = patrones['productos_faltantes_recurrentes'].reset_index()
+                    df_pf.columns = ['Producto', 'Veces Faltante', 'Total Piezas Faltantes', 'Sucursales Afectadas', 'Períodos Distintos']
+
+                    # Clasificar nivel de riesgo
+                    df_pf['Riesgo'] = df_pf.apply(lambda r:
+                        '🔴 ALTO' if r['Veces Faltante'] >= 5 or r['Total Piezas Faltantes'] >= 20
+                        else ('🟡 MEDIO' if r['Veces Faltante'] >= 3 else '🟢 BAJO'), axis=1)
+
+                    st.dataframe(df_pf, use_container_width=True, height=400)
+                else:
+                    st.success("No se detectaron productos con faltantes recurrentes.")
+
+                st.markdown("---")
+
+                # Combinación producto + sucursal
+                st.markdown("##### 🎯 Combinaciones Sospechosas (Producto + Sucursal)")
+                st.markdown("*El mismo producto falta repetidamente en la misma sucursal — patrón muy específico.*")
+                if 'combo_sospechoso' in patrones and not patrones['combo_sospechoso'].empty:
+                    df_combo = patrones['combo_sospechoso'].reset_index()
+                    df_combo.columns = ['Sucursal', 'Producto', 'Veces', 'Total Piezas Faltantes', 'Períodos Distintos']
+
+                    df_combo['Riesgo'] = df_combo.apply(lambda r:
+                        '🔴 ALTO' if r['Veces'] >= 4 or r['Total Piezas Faltantes'] >= 15
+                        else ('🟡 MEDIO' if r['Veces'] >= 3 else '🟢 BAJO'), axis=1)
+
+                    st.dataframe(df_combo, use_container_width=True, height=400)
+                else:
+                    st.success("No se detectaron combinaciones sospechosas.")
+
+                st.markdown("---")
+
+                # Sucursales problemáticas
+                st.markdown("##### 🏪 Sucursales con Más Incongruencias")
+                if 'sucursales_problematicas' in patrones:
+                    df_suc = patrones['sucursales_problematicas'].reset_index()
+                    df_suc.columns = ['Sucursal', 'Total Incidentes', 'Faltantes', 'Sobrantes', 'Piezas Faltantes', 'Productos Afectados', 'Períodos']
+                    st.dataframe(df_suc, use_container_width=True, height=400)
+
+                    # Gráfica
+                    st.bar_chart(df_suc.set_index('Sucursal')['Total Incidentes'].sort_values(ascending=True))
+
+                st.markdown("---")
+
+                # Productos con sobrantes recurrentes
+                st.markdown("##### 📦 Productos con Sobrantes Recurrentes")
+                st.markdown("*Productos que sobran repetidamente — posible error de catálogo o doble escaneo.*")
+                if 'productos_sobrantes_recurrentes' in patrones and not patrones['productos_sobrantes_recurrentes'].empty:
+                    df_ps = patrones['productos_sobrantes_recurrentes'].reset_index()
+                    df_ps.columns = ['Producto', 'Veces Sobrante', 'Total Piezas Sobrantes', 'Sucursales']
+                    st.dataframe(df_ps, use_container_width=True, height=300)
+                else:
+                    st.success("No se detectaron productos con sobrantes recurrentes.")
+
+                st.markdown("---")
+
+                # Botón para limpiar historial
+                st.markdown("##### ⚙️ Administrar Historial")
+                col_admin1, col_admin2 = st.columns(2)
+                with col_admin1:
+                    st.metric("Registros en historial", len(df_hist))
+                with col_admin2:
+                    if st.button("🗑️ Limpiar historial", type="secondary"):
+                        if os.path.exists(DB_PATH):
+                            os.remove(DB_PATH)
+                            init_db()
+                            st.success("Historial limpiado.")
+                            st.rerun()
 
 else:
     # Estado inicial
